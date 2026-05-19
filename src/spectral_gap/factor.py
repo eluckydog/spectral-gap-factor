@@ -30,6 +30,24 @@ import pandas as pd
 from typing import Tuple, Optional
 
 
+_COLS = ["spectral_gap", "gap_zscore", "market_dominance", "signal"]
+
+
+def _nan_row() -> dict:
+    return {c: np.nan for c in _COLS}
+
+
+def _safe_eigvalsh(corr: np.ndarray) -> np.ndarray:
+    """安全计算特征值，处理 NaN/发散相关矩阵。"""
+    if corr.size == 0 or np.isnan(corr).any():
+        return np.array([])
+    try:
+        evals = np.linalg.eigvalsh(corr)
+        return evals[::-1]  # 降序
+    except np.linalg.LinalgError:
+        return np.array([])
+
+
 def _mp_noise_bound(n: int, t: int, q: Optional[float] = None) -> float:
     """Marčenko-Pastur 噪声上界: σ²(1 + √(N/T))²."""
     q = q or n / t
@@ -42,7 +60,6 @@ def _tw_beta1_threshold(p: float) -> float:
     来源: 数值拟合 Tracy-Widom F₁ 分布。
     精确值见 Bornemann (2010) 或 TW 表。
     """
-    # F₁ 分布右尾近似分位数（样条插值）
     _quantiles = {0.50: -1.52, 0.75: -0.79, 0.90: -0.30,
                   0.95: 0.00, 0.99: 0.65, 0.999: 1.50}
     keys, vals = zip(*sorted(_quantiles.items()))
@@ -84,34 +101,32 @@ def compute_gap(
           - signal: -1(集中) / 0(正常) / +1(分散)
     """
     log_returns = np.log(prices / prices.shift(1)).dropna()
-    n_stocks = prices.shape[1]
+    n_cols = prices.shape[1]
+
+    # 前置检查：时间序列不够长，直接返回空结构
+    if len(log_returns) <= window:
+        df = pd.DataFrame([], index=pd.Index([], dtype=log_returns.index.dtype), columns=_COLS)
+        return df
+
     results = []
 
     for i in range(window, len(log_returns)):
         chunk = log_returns.iloc[i - window:i]
-        if chunk.empty or chunk.shape[1] < 3:
-            results.append({
-                "spectral_gap": np.nan, "gap_zscore": np.nan,
-                "market_dominance": np.nan, "signal": 0
-            })
+        n_stocks = chunk.shape[1]
+        if chunk.empty or n_stocks < 3:
+            results.append(_nan_row())
             continue
 
-        # 相关矩阵 → 特征值
         corr = chunk.corr().values
-        evals = np.linalg.eigvalsh(corr)[::-1]  # 降序
+        evals = _safe_eigvalsh(corr)
 
         if len(evals) < 2:
-            results.append({
-                "spectral_gap": np.nan, "gap_zscore": np.nan,
-                "market_dominance": np.nan, "signal": 0
-            })
+            results.append(_nan_row())
             continue
 
         lam1, lam2 = evals[0], evals[1]
         noise_std = estimate_noise_std(evals[2:], trim)
         gap = (lam1 - lam2) / max(noise_std, 1e-10)
-
-        # 市场因子解释方差比例
         dominance = lam1 / max(evals.sum(), 1e-10)
 
         results.append({
@@ -123,18 +138,24 @@ def compute_gap(
 
     df = pd.DataFrame(results, index=log_returns.index[window:])
 
+    # 确保所有列存在
+    for c in _COLS:
+        if c not in df.columns:
+            df[c] = np.nan
+
     # 滚动 z-score
     if len(df) > 60:
+        rolling_gap = df["spectral_gap"].rolling(60, min_periods=20)
         df["gap_zscore"] = (
-            (df["spectral_gap"] - df["spectral_gap"].rolling(60, min_periods=20).mean())
-            / df["spectral_gap"].rolling(60, min_periods=20).std().clip(lower=1e-6)
+            (df["spectral_gap"] - rolling_gap.mean())
+            / rolling_gap.std().clip(lower=1e-6)
         )
 
     # 信号生成
     tw_95 = _tw_beta1_threshold(0.95)
     df["signal"] = 0
-    df.loc[df["gap_zscore"] > tw_95, "signal"] = -1   # 集中度过高
-    df.loc[df["gap_zscore"] < -tw_95, "signal"] = 1    # 分散化开启
+    df.loc[df["gap_zscore"] > tw_95, "signal"] = -1
+    df.loc[df["gap_zscore"] < -tw_95, "signal"] = 1
 
     return df
 
@@ -142,12 +163,12 @@ def compute_gap(
 def factor_stats(df: pd.DataFrame) -> dict:
     """返回因子统计摘要。"""
     sig = df["signal"].dropna()
-    if len(sig) == 0:
+    if len(sig) == 0 or "spectral_gap" not in df.columns:
         return {"error": "no data"}
     return {
-        "signal_freq_1": float((sig == 1).mean()),   # 分散信号占比
-        "signal_freq_neg1": float((sig == -1).mean()),  # 集中信号占比
-        "signal_freq_0": float((sig == 0).mean()),     # 中性占比
+        "signal_freq_1": float((sig == 1).mean()),
+        "signal_freq_neg1": float((sig == -1).mean()),
+        "signal_freq_0": float((sig == 0).mean()),
         "mean_gap": float(df["spectral_gap"].mean()),
         "std_gap": float(df["spectral_gap"].std()),
         "mean_dominance": float(df["market_dominance"].mean()),
